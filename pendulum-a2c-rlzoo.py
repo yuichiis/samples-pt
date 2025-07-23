@@ -176,10 +176,22 @@ def update(actor_critic, optimizer, experiences, gamma, gae_lambda, value_loss_w
     return policy_loss.item(), value_loss.item(), entropy.item()
 
 # === 学習ループ (PyTorch版) ===
+# === 学習ループ (PyTorch版) ★★★最終修正案★★★ ===
 def train(env, actor_critic, action_bound, device):
     standardize = False
     total_timesteps = 1_000_000
-    n_steps = 8
+    
+    # --- ここからが重要な変更 ---
+    # RL Zooのパラメータ
+    n_envs_zoo = 8  # RL Zooで使われている並列環境数
+    n_steps_zoo = 8   # RL Zooのn_steps
+    
+    # シングル環境でRL Zooのバッチサイズを再現するための更新間隔
+    # 1回の更新に使うデータのサイズを n_envs * n_steps に合わせる
+    update_interval = n_envs_zoo * n_steps_zoo  # 8 * 8 = 64
+    
+    # --- ここまでが重要な変更 ---
+
     gamma = 0.9
     gae_lambda = 0.9
     
@@ -190,10 +202,10 @@ def train(env, actor_critic, action_bound, device):
     value_loss_weight = 0.5
     entropy_weight = 0.0
 
-    print('A2C for Pendulum-v1 (PyTorch - RL Zoo Config)')
-    print(f'standardize = {standardize}, total_timesteps = {total_timesteps}, n_steps = {n_steps}')
-    
-    # オプティマイザ (SB3のA2Cのデフォルトに合わせてalpha=0.99, eps=1e-5)
+    print('A2C for Pendulum-v1 (PyTorch - Single Env Emulation)')
+    print(f'standardize = {standardize}, total_timesteps = {total_timesteps}')
+    print(f'Simulating {n_envs_zoo} envs with update_interval = {update_interval}')
+
     optimizer = RMSprop(actor_critic.parameters(), lr=lr_initial, alpha=0.99, eps=1e-5)
 
     print("--- 学習開始 ---")
@@ -206,7 +218,7 @@ def train(env, actor_critic, action_bound, device):
     state, _ = env.reset()
 
     for global_step in range(1, total_timesteps + 1):
-        # 学習率の線形減衰
+        # 学習率の線形減衰 (変更なし)
         frac = 1.0 - (global_step - 1.0) / total_timesteps
         lr_now = frac * (lr_initial - lr_final) + lr_final
         optimizer.param_groups[0]['lr'] = lr_now
@@ -231,7 +243,9 @@ def train(env, actor_critic, action_bound, device):
             episode_reward_sum, episode_step_count = 0, 0
             state, _ = env.reset()
 
-        if len(experiences) >= n_steps:
+        # ★★★ ここが一番の変更点 ★★★
+        # 64ステップ分のデータが溜まったら学習する
+        if len(experiences) >= update_interval:
             actor_loss, critic_loss, entropy = update(
                 actor_critic, optimizer, experiences, gamma, gae_lambda, value_loss_weight,
                 entropy_weight, max_grad_norm, standardize, action_bound, device
@@ -239,13 +253,14 @@ def train(env, actor_critic, action_bound, device):
             all_actor_losses.append(actor_loss)
             all_critic_losses.append(critic_loss)
             all_entropies.append(entropy)
-            experiences = []
+            experiences = [] # 経験バッファをクリア
 
-        if (global_step % (n_steps * 200) == 0) or global_step == total_timesteps:
+        # ログ表示の頻度を調整
+        if (global_step % (update_interval * 30) == 0) or global_step == total_timesteps:
             avg_reward = np.mean(all_rewards[-20:]) if all_rewards else -1600
             print(f'St:{global_step//1000}k | Ep:{episode_count} | AvgRwd:{avg_reward:.1f} | '
-                  f'ActorL:{np.mean(all_actor_losses[-200:]):.3f} | CriticL:{np.mean(all_critic_losses[-200:]):.3f} | '
-                  f'Entr:{np.mean(all_entropies[-200:]):.3f} | LR:{lr_now:.2e}')
+                  f'ActorL:{np.mean(all_actor_losses[-30:]):.3f} | CriticL:{np.mean(all_critic_losses[-30:]):.3f} | '
+                  f'Entr:{np.mean(all_entropies[-30:]):.3f} | LR:{lr_now:.2e}')
             
             if avg_reward > -200 and len(all_rewards) > 20:
                 print(f"環境がクリアされました！ (平均報酬: {avg_reward})")
