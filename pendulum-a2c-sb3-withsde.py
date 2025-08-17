@@ -16,39 +16,46 @@ class MyGSDELikeActorCriticPolicy(nn.Module):
         log_std_init: float,
         use_sde: bool = False,
         sde_sample_freq: int = -1,
-        # ... 他の引数
+        ortho_init: bool = False, # 使わないが互換性のために残す
     ):
         super().__init__()
-        # ... (共通ネットワークの定義は同じ) ...
-        self.policy_net_base = nn.Sequential(...)
-        self.value_net_base = nn.Sequential(...)
+        # Actor (方策) と Critic (価値) は同じ構造のネットワークとする
+        self.policy_net_base = nn.Sequential(
+            nn.Linear(obs_dim, 64), nn.Tanh(),
+            nn.Linear(64, 64), nn.Tanh()
+        )
+        self.value_net_base = nn.Sequential(
+            nn.Linear(obs_dim, 64), nn.Tanh(),
+            nn.Linear(64, 64), nn.Tanh()
+        )
         self.action_net = nn.Linear(64, action_dim) # 平均を出すヘッド
         self.value_net = nn.Linear(64, 1)
 
         self.use_sde = use_sde
         self.sde_sample_freq = sde_sample_freq
-        self.latent_sde_dim = 64 # 特徴量の次元
+        self.latent_sde_dim = 64
+        self.action_dim = action_dim
 
         if self.use_sde:
-            # 状態に依存しない学習可能なlog_stdパラメータ
+            # 状態依存の分散を計算するための学習可能なパラメータ
             self.log_std = nn.Parameter(torch.ones(self.latent_sde_dim, action_dim) * log_std_init)
-            self.exploration_mat = None # ノイズ射影行列
-            self.exploration_noise = None # SB3のSDEではこれは使わない
-            # 最初のサンプリング
+            # 探索用のノイズ射影行列 (学習しない)
+            # register_bufferでモデルの状態として保存するが、optimizerの対象外
+            self.register_buffer('exploration_mat', torch.zeros(self.latent_sde_dim, self.action_dim))
+            # 初期化
             self.sample_exploration_matrix()
         else:
             # 通常のSDEでない場合
             self.log_std = nn.Parameter(torch.ones(action_dim) * log_std_init)
-            
+
     def sample_exploration_matrix(self):
-        """ノイズ射影行列をサンプリングする"""
-        # 正規分布からサンプリング
-        std = torch.exp(self.log_std)
-        self.exploration_mat = torch.randn_like(self.log_std) * std
+        """ノイズ射影行列を単位正規分布からサンプリングする"""
+        # self.exploration_matはbufferとして登録されているので、.dataを直接変更
+        self.exploration_mat.data.normal_(0.0, 1.0)
 
     def get_sde_noise(self, latent_sde: torch.Tensor) -> torch.Tensor:
         """gSDEのノイズを計算する"""
-        # 毎ステップ、特徴量と行列を掛ける
+        # 潜在特徴量とノイズ射影行列を掛ける
         return torch.mm(latent_sde, self.exploration_mat)
 
     def forward(
@@ -62,20 +69,22 @@ class MyGSDELikeActorCriticPolicy(nn.Module):
         value = self.value_net(latent_vf).flatten()
         mean_actions = self.action_net(latent_pi)
         
+        # log_stdをクリップして安定化
+        log_std = torch.clamp(self.log_std, -20, 2)
+
         if deterministic:
             action = mean_actions
             # 決定論的な場合でも、分布の計算は必要
             if self.use_sde:
                 # gSDEの分散は状態に依存する
-                variance = torch.mm(latent_pi**2, torch.exp(self.log_std)**2)
+                variance = torch.mm(latent_pi**2, torch.exp(log_std)**2)
                 distribution = Normal(mean_actions, torch.sqrt(variance + 1e-6))
             else:
-                distribution = Normal(mean_actions, torch.exp(self.log_std))
+                distribution = Normal(mean_actions, torch.exp(log_std))
             log_prob = distribution.log_prob(action).sum(axis=-1)
 
         else: # 探索的な行動
             if self.use_sde:
-                # gSDEの探索時の実装
                 # sde_sample_freq > 0 の場合、その頻度でノイズ行列を再サンプリング
                 if self.sde_sample_freq > 0 and self.training and np.random.randint(self.sde_sample_freq) == 0:
                     self.sample_exploration_matrix()
@@ -84,12 +93,12 @@ class MyGSDELikeActorCriticPolicy(nn.Module):
                 action = mean_actions + noise
                 
                 # log_prob計算用の分布を構築
-                variance = torch.mm(latent_pi**2, torch.exp(self.log_std)**2)
+                variance = torch.mm(latent_pi**2, torch.exp(log_std)**2)
                 distribution = Normal(mean_actions, torch.sqrt(variance + 1e-6))
                 log_prob = distribution.log_prob(action).sum(axis=-1)
             else:
                 # 通常のサンプリング
-                distribution = Normal(mean_actions, torch.exp(self.log_std))
+                distribution = Normal(mean_actions, torch.exp(log_std))
                 action = distribution.rsample()
                 log_prob = distribution.log_prob(action).sum(axis=-1)
 
@@ -105,132 +114,18 @@ class MyGSDELikeActorCriticPolicy(nn.Module):
         mean_actions = self.action_net(latent_pi)
         value = self.value_net(latent_vf).flatten()
 
+        # log_stdをクリップして安定化
+        log_std = torch.clamp(self.log_std, -20, 2)
+
         if self.use_sde:
-            variance = torch.mm(latent_pi**2, torch.exp(self.log_std)**2)
+            variance = torch.mm(latent_pi**2, torch.exp(log_std)**2)
             distribution = Normal(mean_actions, torch.sqrt(variance + 1e-6))
         else:
-            distribution = Normal(mean_actions, torch.exp(self.log_std))
+            distribution = Normal(mean_actions, torch.exp(log_std))
             
         log_prob = distribution.log_prob(action).sum(axis=-1)
         entropy = distribution.entropy().sum(axis=-1)
         return value, log_prob, entropy
-
-## --- Step 1: ポリシーネットワークをSDE対応に大幅修正 ---
-#class MyReplicatedActorCriticPolicy(nn.Module):
-#    """
-#    SDE (State-Dependent Exploration) に対応したActor-Criticポリシー。
-#    """
-#    def __init__(
-#        self,
-#        obs_dim: int,
-#        action_dim: int,
-#        log_std_init: float,
-#        # SDE関連の引数を追加
-#        use_sde: bool = False,
-#        sde_sample_freq: int = -1, # -1は毎ステップサンプリングを意味する
-#        ortho_init: bool = False,
-#    ):
-#        super().__init__()
-#        self.obs_dim = obs_dim
-#        self.action_dim = action_dim
-#        self.use_sde = use_sde
-#        self.sde_sample_freq = sde_sample_freq
-#        
-#        # 共有ネットワークや個別のネットワークを定義
-#        # SB3ではMlpExtractorがこの役割を担うが、今回は直接定義
-#        # Actor (方策) と Critic (価値) は同じ構造のネットワークとする
-#        self.policy_net_base = nn.Sequential(
-#            nn.Linear(obs_dim, 64), nn.Tanh(),
-#            nn.Linear(64, 64), nn.Tanh()
-#        )
-#        self.value_net_base = nn.Sequential(
-#            nn.Linear(obs_dim, 64), nn.Tanh(),
-#            nn.Linear(64, 64), nn.Tanh()
-#        )
-#        # 最後の線形層 (ヘッド)
-#        self.action_net = nn.Linear(64, action_dim)
-#        self.value_net = nn.Linear(64, 1)
-#
-#        if self.use_sde:
-#            # SDE用のノイズ射影ネットワーク
-#            # 特徴量と同じ次元(64)から行動次元への射影
-#            self.sde_net = nn.Linear(64, action_dim)
-#            # SDEで使うための、使い回すノイズ(epsilon)
-#            self.exploration_noise = None
-#        else:
-#            # SDEを使わない場合: 状態に依存しない学習可能なlog_std
-#            self.log_std = nn.Parameter(torch.ones(action_dim) * log_std_init)
-#
-#    def _get_std(self, latent_sde: torch.Tensor) -> torch.Tensor:
-#        """SDE用の標準偏差を計算する"""
-#        # SB3ではlog_stdを-20から2の範囲にクリップする
-#        log_std = self.sde_net(latent_sde)
-#        log_std = torch.clamp(log_std, -20, 2)
-#        return torch.exp(log_std)
-#
-#    def _get_distribution(
-#        self,
-#        mean_actions: torch.Tensor,
-#        latent_sde: Optional[torch.Tensor] = None
-#    ) -> Normal:
-#        """観測から行動の確率分布を構築する"""
-#        if self.use_sde:
-#            # SDEの場合、標準偏差は状態に依存する
-#            std = self._get_std(latent_sde)
-#        else:
-#            # SDEでない場合、標準偏差は状態に依存しない
-#            std = torch.exp(self.log_std)
-#        return Normal(mean_actions, std)
-#
-#    def forward(
-#        self,
-#        obs: torch.Tensor,
-#        deterministic: bool = False
-#    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-#        """行動を決定し、その価値と対数確率を返す"""
-#        # 特徴抽出
-#        latent_pi = self.policy_net_base(obs)
-#        latent_vf = self.value_net_base(obs)
-#        # 価値を計算
-#        value = self.value_net(latent_vf).flatten()
-#        # 行動の平均を計算
-#        mean_actions = self.action_net(latent_pi)
-#        
-#        # 行動分布を構築
-#        distribution = self._get_distribution(mean_actions, latent_sde=latent_pi)
-#
-#        if deterministic:
-#            action = mean_actions
-#        else:
-#            if self.use_sde:
-#                # SDEのサンプリング
-#                # SB3の簡易再現: sde_sample_freqごとにノイズを再サンプリング
-#                if self.exploration_noise is None or self.sde_sample_freq > 0 and self.training and np.random.randint(self.sde_sample_freq) == 0:
-#                    self.exploration_noise = torch.randn_like(mean_actions)
-#                # 行動 = 平均 + std * ε
-#                action = mean_actions + distribution.stddev * self.exploration_noise
-#            else:
-#                # 通常のサンプリング
-#                action = distribution.rsample()
-#
-#        log_prob = distribution.log_prob(action).sum(axis=-1)
-#        return action, value, log_prob
-#
-#    def evaluate_actions(
-#        self,
-#        obs: torch.Tensor,
-#        action: torch.Tensor
-#    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-#        """与えられた観測と行動に対して、価値、対数確率、エントロピーを評価する"""
-#        latent_pi = self.policy_net_base(obs)
-#        latent_vf = self.value_net_base(obs)
-#        mean_actions = self.action_net(latent_pi)
-#        value = self.value_net(latent_vf).flatten()
-#
-#        distribution = self._get_distribution(mean_actions, latent_sde=latent_pi)
-#        log_prob = distribution.log_prob(action).sum(axis=-1)
-#        entropy = distribution.entropy().sum(axis=-1)
-#        return value, log_prob, entropy
 
 # --- ロールアウトバッファ (変更なし) ---
 class RolloutBuffer:
@@ -280,7 +175,10 @@ def evaluate_policy(policy, eval_env, n_eval_episodes, deterministic=True):
         while not done:
             with torch.no_grad():
                 action, _, _ = policy(torch.as_tensor(obs).float(), deterministic=deterministic)
-            next_obs, reward, term, trunc, _ = eval_env.step(action.numpy())
+            # `action` is a tensor, needs to be converted to numpy
+            # Also, the environment expects a numpy array for the action
+            action_np = action.cpu().numpy()
+            next_obs, reward, term, trunc, _ = eval_env.step(action_np)
             done = (term | trunc)[0]
             total_reward += reward[0]
             obs = next_obs
@@ -303,6 +201,7 @@ class MyA2C:
         self.ent_coef, self.vf_coef, self.max_grad_norm = ent_coef, vf_coef, max_grad_norm
         self.eval_env, self.eval_freq, self.n_eval_episodes = eval_env, eval_freq, n_eval_episodes
         self.last_eval_timestep = 0
+        self.total_timesteps = 0 # total_timestepsを初期化
 
         torch.manual_seed(seed), np.random.seed(seed)
         
@@ -324,7 +223,9 @@ class MyA2C:
         for _ in range(self.n_steps):
             with torch.no_grad():
                 action, value, log_prob = self.policy(torch.as_tensor(self._last_obs).float())
-            next_obs, reward, term, trunc, _ = self.env.step(action.numpy())
+            # `action` is a tensor, needs to be converted to numpy
+            action_np = action.cpu().numpy()
+            next_obs, reward, term, trunc, _ = self.env.step(action_np)
             done = term | trunc
             self.buffer.add(self._last_obs, action, reward, done, value, log_prob)
             self._last_obs, self.num_timesteps = next_obs, self.num_timesteps + self.n_envs
@@ -336,19 +237,24 @@ class MyA2C:
 
     def train(self):
         self._n_updates += 1
-        progress = self.num_timesteps / self.total_timesteps
+        # `total_timesteps` が0の場合のゼロ除算を避ける
+        progress = self.num_timesteps / self.total_timesteps if self.total_timesteps > 0 else 0
         new_lr = self.lr_schedule(1.0 - progress)
         for pg in self.optimizer.param_groups: pg["lr"] = new_lr
 
         data = self.buffer.get()
         values, log_prob, entropy = self.policy.evaluate_actions(data["observations"].float(), data["actions"].float())
         
-        loss = -(data["advantages"] * log_prob).mean() + self.vf_coef * F.mse_loss(data["returns"], values) - self.ent_coef * torch.mean(entropy)
+        policy_loss = -(data["advantages"] * log_prob).mean()
+        value_loss = F.mse_loss(data["returns"], values)
+        entropy_loss = -torch.mean(entropy)
+        
+        loss = policy_loss + self.vf_coef * value_loss + self.ent_coef * entropy_loss
         
         self.optimizer.zero_grad(), loss.backward()
         torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
         self.optimizer.step()
-        if self._n_updates % 100 == 0: print(f"Timesteps: {self.num_timesteps}, LR: {new_lr:.2e}, Loss: {loss.item():.4f}")
+        if self._n_updates % 100 == 0: print(f"Timesteps: {self.num_timesteps}, LR: {new_lr:.2e}, Loss: {loss.item():.4f}, Policy: {policy_loss.item():.4f}, Value: {value_loss.item():.4f}")
 
     def learn(self, total_timesteps: int):
         self.total_timesteps = total_timesteps
@@ -374,17 +280,19 @@ if __name__ == "__main__":
         "use_sde": True, # ★ SDEを有効化 ★
         "policy_kwargs": dict(log_std_init=-2, ortho_init=False),
     }
-    N_ENVS, TOTAL_TIMESTEPS = 8, 1_000_000
+    N_ENVS, TOTAL_TIMESTEPS = 8, 250_000 # タイムステップを短縮
     ENV_ID, SEED = "Pendulum-v1", 42
 
     def linear_schedule(initial_value): return lambda p: p * initial_value
     
     env = gym.make_vec(ENV_ID, num_envs=N_ENVS)
     eval_env = gym.make_vec(ENV_ID, num_envs=1)
-    eval_freq = max(10000 // N_ENVS, 1) * N_ENVS
+    # 評価頻度を調整
+    eval_freq = max((10000 // N_ENVS) * N_ENVS, N_ENVS * 8)
+
 
     model = MyA2C(
-        env=env, policy_class=MyGSDELikeActorCriticPolicy, #MyReplicatedActorCriticPolicy,
+        env=env, policy_class=MyGSDELikeActorCriticPolicy,
         learning_rate=linear_schedule(7e-4),
         eval_env=eval_env, eval_freq=eval_freq, **hyperparams, seed=SEED,
     )
